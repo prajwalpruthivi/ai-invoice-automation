@@ -1,0 +1,293 @@
+{
+  "name": "Invoice Automation - 1. Ingestion",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": { "item": [ { "mode": "everyMinute" } ] },
+        "simple": false,
+        "filters": {
+          "q": "has:attachment filename:pdf newer_than:1d"
+        },
+        "options": { "downloadAttachments": true }
+      },
+      "id": "1a2b3c4d-0001-0000-0000-000000000001",
+      "name": "Gmail Trigger - New Invoice Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [-1400, 300],
+      "credentials": { "gmailOAuth2": { "id": "GMAIL_CREDENTIAL_ID", "name": "Invoicing Inbox Gmail" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "has-pdf-check",
+              "leftValue": "={{ $binary && Object.keys($binary).some(k => $binary[k].mimeType === 'application/pdf') }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "1a2b3c4d-0002-0000-0000-000000000002",
+      "name": "IF - Has PDF Attachment",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-1180, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Capture required email metadata for the audit trail and downstream nodes\nconst meta = {\n  sender: $json.from || $json.headers?.from || '',\n  senderEmail: (($json.from || '').match(/<(.+)>/) || [null, $json.from])[1],\n  senderName: (($json.from || '').split('<')[0] || '').trim(),\n  subject: $json.subject || '',\n  receivedAt: $json.date || new Date().toISOString()\n};\nreturn [{ json: { ...$json, emailMeta: meta }, binary: $binary }];"
+      },
+      "id": "1a2b3c4d-0003-0000-0000-000000000003",
+      "name": "Set - Capture Email Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-960, 220]
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "={{ Object.keys($binary).find(k => $binary[k].mimeType === 'application/pdf') }}"
+      },
+      "id": "1a2b3c4d-0004-0000-0000-000000000004",
+      "name": "Extract From File - PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [-740, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"claude-sonnet-4-6\",\n  max_tokens: 2048,\n  temperature: 0,\n  system: $node[\"Set - System Prompt\"].json.systemPrompt,\n  messages: [ { role: \"user\", content: \"Extract the invoice data from the following PDF text and return the JSON object as instructed.\\n\\n--- BEGIN INVOICE TEXT ---\\n\" + $json.text + \"\\n--- END INVOICE TEXT ---\" } ]\n}) }}",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0005-0000-0000-000000000005",
+      "name": "Anthropic API - Extract Invoice JSON",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-300, 220],
+      "credentials": { "httpHeaderAuth": { "id": "ANTHROPIC_API_CREDENTIAL_ID", "name": "Anthropic API Key (x-api-key header)" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loads the extraction system prompt (kept in a Code node so it is version-controlled with the workflow export; see ai-extraction-prompt.md for the human-readable copy)\nconst systemPrompt = `You are an invoice data extraction engine used inside an automated accounts-payable pipeline. You will be given the raw text extracted from a supplier PDF invoice (the extraction may have imperfect spacing or line breaks due to PDF-to-text conversion). Your job is to return ONLY a single valid JSON object with the exact schema below. No prose, no markdown fences, no explanation - JSON only.\n\nRules:\n1. If a field cannot be found, return null for it (never omit the key).\n2. Normalize all dates to ISO 8601 (YYYY-MM-DD).\n3. Normalize all monetary amounts to plain numbers using \".\" as the decimal separator.\n4. currency must be a 3-letter ISO 4217 code, inferred from symbols/context if needed.\n5. vat_percent is a number, e.g. 19 for 19%.\n6. line_items is an array of { description, quantity, unit_price, line_total }, excluding blank rows or repeated headers.\n7. confidence_score is your own 0-1 estimate of extraction confidence.\n8. anomalies is an array of short flags for a human reviewer, e.g. mismatched totals, missing IBAN, due date before invoice date. Empty array if none.\n9. Never invent values; prefer null plus an anomaly note over a guess.\n\nReturn strictly this JSON shape: {\"vendor\":null,\"vendor_uid\":null,\"vendor_iban\":null,\"invoice_number\":null,\"invoice_date\":null,\"due_date\":null,\"net_amount\":null,\"vat_amount\":null,\"vat_percent\":null,\"gross_amount\":null,\"currency\":null,\"cost_center\":null,\"line_items\":[],\"confidence_score\":0,\"anomalies\":[]}`;\nreturn [{ json: { ...$json, systemPrompt } }];"
+      },
+      "id": "1a2b3c4d-0006-0000-0000-000000000006",
+      "name": "Set - System Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 4: Data Cleaning - safely parse, strip fences defensively, validate, and normalize the AI response\nlet raw = $json.content?.[0]?.text || '{}';\nraw = raw.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();\n\nlet data;\ntry {\n  data = JSON.parse(raw);\n} catch (e) {\n  return [{ json: { extractionError: true, errorMessage: 'Failed to parse AI JSON: ' + e.message, rawResponse: raw } }];\n}\n\nconst num = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(v);\n  return isNaN(n) ? null : n;\n};\n\nconst cleanLineItems = (Array.isArray(data.line_items) ? data.line_items : [])\n  .filter(li => li && (li.description || '').trim().length > 0)\n  .map(li => ({\n    description: (li.description || '').trim(),\n    quantity: num(li.quantity),\n    unit_price: num(li.unit_price),\n    line_total: num(li.line_total)\n  }));\n\nconst anomalies = Array.isArray(data.anomalies) ? data.anomalies : [];\n\n// Cross-check math and append anomalies the AI may have missed\nconst net = num(data.net_amount), vat = num(data.vat_amount), gross = num(data.gross_amount);\nif (net !== null && vat !== null && gross !== null && Math.abs((net + vat) - gross) > 0.02) {\n  anomalies.push('Net + VAT does not equal Gross Amount (validation check)');\n}\n\nconst cleaned = {\n  vendor: data.vendor || null,\n  vendor_uid: data.vendor_uid || null,\n  vendor_iban: data.vendor_iban || null,\n  invoice_number: data.invoice_number || null,\n  invoice_date: data.invoice_date || null,\n  due_date: data.due_date || null,\n  net_amount: net,\n  vat_amount: vat,\n  vat_percent: num(data.vat_percent),\n  gross_amount: gross,\n  currency: data.currency || null,\n  cost_center: data.cost_center || null,\n  line_items: cleanLineItems,\n  confidence_score: num(data.confidence_score) ?? 0,\n  anomalies\n};\n\nreturn [{ json: { ...cleaned, extractionError: false } }];"
+      },
+      "id": "1a2b3c4d-0007-0000-0000-000000000007",
+      "name": "Code - Clean & Validate AI Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-80, 220]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "extraction-error-check",
+              "leftValue": "={{ $json.extractionError }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "1a2b3c4d-0008-0000-0000-000000000008",
+      "name": "IF - Extraction Error",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [140, 220]
+    },
+    {
+      "parameters": {
+        "resource": "record",
+        "operation": "create",
+        "base": { "value": "AIRTABLE_BASE_ID", "mode": "id" },
+        "table": { "value": "Invoices", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Vendor": "={{ $json.vendor }}",
+            "Vendor UID": "={{ $json.vendor_uid }}",
+            "Vendor IBAN": "={{ $json.vendor_iban }}",
+            "Invoice Number": "={{ $json.invoice_number }}",
+            "Invoice Date": "={{ $json.invoice_date }}",
+            "Due Date": "={{ $json.due_date }}",
+            "Net Amount": "={{ $json.net_amount }}",
+            "VAT Amount": "={{ $json.vat_amount }}",
+            "VAT %": "={{ $json.vat_percent }}",
+            "Gross Amount": "={{ $json.gross_amount }}",
+            "Currency": "={{ $json.currency }}",
+            "Cost Center": "={{ $json.cost_center }}",
+            "Line Items": "={{ JSON.stringify($json.line_items) }}",
+            "Confidence": "={{ $json.confidence_score }}",
+            "Anomalies": "={{ JSON.stringify($json.anomalies) }}",
+            "Application Status": "Draft",
+            "Send for Approval": false,
+            "Sender": "={{ $node['Set - Capture Email Metadata'].json.emailMeta.sender }}",
+            "Sender Email": "={{ $node['Set - Capture Email Metadata'].json.emailMeta.senderEmail }}",
+            "Sender Name": "={{ $node['Set - Capture Email Metadata'].json.emailMeta.senderName }}",
+            "Email Subject": "={{ $node['Set - Capture Email Metadata'].json.emailMeta.subject }}",
+            "Email Received": true,
+            "Received At": "={{ $node['Set - Capture Email Metadata'].json.emailMeta.receivedAt }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0009-0000-0000-000000000009",
+      "name": "Airtable - Create Invoice Record",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [360, 140],
+      "credentials": { "airtableTokenApi": { "id": "AIRTABLE_CREDENTIAL_ID", "name": "Airtable Token" } }
+    },
+    {
+      "parameters": {
+        "resource": "record",
+        "operation": "update",
+        "base": { "value": "AIRTABLE_BASE_ID", "mode": "id" },
+        "table": { "value": "Invoices", "mode": "name" },
+        "id": "={{ $json.id }}",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "PDF Attachment": "={{ [{ url: $node['Extract From File - PDF Text'].binary[Object.keys($node['Extract From File - PDF Text'].binary)[0]].id ? undefined : undefined }] }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0010-0000-0000-00000000000a",
+      "name": "Airtable - Attach Original PDF",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [580, 140],
+      "notes": "n8n's Airtable node accepts binary data directly for Attachment fields when 'Attachments' column type is used with binary input mapping - configure the attachment field mapping to the incoming binary property in the UI (see README: Attachment upload note).",
+      "credentials": { "airtableTokenApi": { "id": "AIRTABLE_CREDENTIAL_ID", "name": "Airtable Token" } }
+    },
+    {
+      "parameters": {
+        "resource": "record",
+        "operation": "create",
+        "base": { "value": "AIRTABLE_BASE_ID", "mode": "id" },
+        "table": { "value": "Audit Log", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Invoice": "={{ [$json.id] }}",
+            "Action": "Created",
+            "Actor": "System (AI)",
+            "Details": "={{ 'Invoice record created via AI extraction. Confidence: ' + $node['Code - Clean & Validate AI Output'].json.confidence_score + '. Anomalies: ' + JSON.stringify($node['Code - Clean & Validate AI Output'].json.anomalies) }}",
+            "Timestamp": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0011-0000-0000-00000000000b",
+      "name": "Airtable - Log Audit Entry",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [800, 140],
+      "credentials": { "airtableTokenApi": { "id": "AIRTABLE_CREDENTIAL_ID", "name": "Airtable Token" } }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "channel": "#invoice-processing-alerts",
+        "text": "=:warning: Invoice extraction failed for email from *{{ $node['Set - Capture Email Metadata'].json.emailMeta.senderEmail }}* (subject: \"{{ $node['Set - Capture Email Metadata'].json.emailMeta.subject }}\").\\nError: {{ $json.errorMessage }}\\nThe email has been left in the inbox for manual handling."
+      },
+      "id": "1a2b3c4d-0012-0000-0000-00000000000c",
+      "name": "Slack - Notify Extraction Failure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [360, 340],
+      "credentials": { "slackApi": { "id": "SLACK_CREDENTIAL_ID", "name": "Ops Slack Bot" } }
+    },
+    {
+      "parameters": {
+        "resource": "record",
+        "operation": "create",
+        "base": { "value": "AIRTABLE_BASE_ID", "mode": "id" },
+        "table": { "value": "Audit Log", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Action": "Error",
+            "Actor": "System (AI)",
+            "Details": "={{ 'PDF extraction/AI parsing failed for email from ' + $node['Set - Capture Email Metadata'].json.emailMeta.senderEmail + '. Error: ' + $json.errorMessage }}",
+            "Timestamp": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0013-0000-0000-00000000000d",
+      "name": "Airtable - Log Error to Audit",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [580, 340],
+      "credentials": { "airtableTokenApi": { "id": "AIRTABLE_CREDENTIAL_ID", "name": "Airtable Token" } }
+    },
+    {
+      "parameters": {},
+      "id": "1a2b3c4d-0014-0000-0000-00000000000e",
+      "name": "NoOp - Ignore (No PDF Attachment)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [-960, 400]
+    }
+  ],
+  "connections": {
+    "Gmail Trigger - New Invoice Email": { "main": [ [ { "node": "IF - Has PDF Attachment", "type": "main", "index": 0 } ] ] },
+    "IF - Has PDF Attachment": {
+      "main": [
+        [ { "node": "Set - Capture Email Metadata", "type": "main", "index": 0 } ],
+        [ { "node": "NoOp - Ignore (No PDF Attachment)", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Set - Capture Email Metadata": { "main": [ [ { "node": "Extract From File - PDF Text", "type": "main", "index": 0 } ] ] },
+    "Extract From File - PDF Text": { "main": [ [ { "node": "Set - System Prompt", "type": "main", "index": 0 } ] ] },
+    "Set - System Prompt": { "main": [ [ { "node": "Anthropic API - Extract Invoice JSON", "type": "main", "index": 0 } ] ] },
+    "Anthropic API - Extract Invoice JSON": { "main": [ [ { "node": "Code - Clean & Validate AI Output", "type": "main", "index": 0 } ] ] },
+    "Code - Clean & Validate AI Output": { "main": [ [ { "node": "IF - Extraction Error", "type": "main", "index": 0 } ] ] },
+    "IF - Extraction Error": {
+      "main": [
+        [ { "node": "Slack - Notify Extraction Failure", "type": "main", "index": 0 } ],
+        [ { "node": "Airtable - Create Invoice Record", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Slack - Notify Extraction Failure": { "main": [ [ { "node": "Airtable - Log Error to Audit", "type": "main", "index": 0 } ] ] },
+    "Airtable - Create Invoice Record": { "main": [ [ { "node": "Airtable - Attach Original PDF", "type": "main", "index": 0 } ] ] },
+    "Airtable - Attach Original PDF": { "main": [ [ { "node": "Airtable - Log Audit Entry", "type": "main", "index": 0 } ] ] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "callerPolicy": "workflowsFromSameOwner" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}
